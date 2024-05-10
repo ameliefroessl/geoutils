@@ -1,9 +1,11 @@
 """
 Module for dask-delayed functions for out-of-memory raster operations.
 """
+
 from __future__ import annotations
 
 import warnings
+from itertools import zip_longest
 from typing import Any, Literal, TypeVar
 
 import dask.array as da
@@ -15,7 +17,7 @@ import rasterio as rio
 from dask.utils import cached_cumsum
 from scipy.interpolate import interpn
 
-from geoutils._typing import NDArrayNum
+from geoutils._typing import NDArrayBool, NDArrayNum
 from geoutils.projtools import _get_bounds_projected, _get_footprint_projected
 
 # 1/ SUBSAMPLING
@@ -96,28 +98,51 @@ def _get_indices_block_per_subsample(
 
 
 @dask.delayed  # type: ignore
-def _delayed_nb_valids(arr_chunk: NDArrayNum) -> NDArrayNum:
+def _delayed_nb_valids(arr_chunk: NDArrayNum, mask_chunk: NDArrayBool | None = None) -> NDArrayNum:
     """Count number of valid values per block."""
-    return np.array([np.count_nonzero(np.isfinite(arr_chunk))]).reshape((1, 1))
+    if mask_chunk is not None:
+        # the mask can have non valid data as well, so our valid data is where:
+        # the mask is True, the mask is valid, the data is valid
+        valid_mask = np.where(np.isfinite(mask_chunk) & np.isfinite(arr_chunk), mask_chunk, False)
+        n_valids = np.count_nonzero(valid_mask)
+    else:
+        n_valids = np.count_nonzero(np.isfinite(arr_chunk))
+
+    return np.array([n_valids]).reshape((1, 1))
 
 
 @dask.delayed  # type: ignore
-def _delayed_subsample_block(arr_chunk: NDArrayNum, subsample_indices: NDArrayNum) -> NDArrayNum:
+def _delayed_subsample_block(
+    arr_chunk: NDArrayNum, subsample_indices: NDArrayNum, mask_chunk: NDArrayBool | None = None
+) -> NDArrayNum:
     """Subsample the valid values at the corresponding 1D valid indices per block."""
 
-    s_chunk = arr_chunk[np.isfinite(arr_chunk)][subsample_indices]
+    if mask_chunk is not None:
+        valid_mask = np.where(np.isfinite(mask_chunk) & np.isfinite(arr_chunk), mask_chunk, False)
+        chunk = arr_chunk[valid_mask]
+    else:
+        chunk = arr_chunk[np.isfinite(arr_chunk)]
 
-    return s_chunk
+    return chunk[subsample_indices]
 
 
 @dask.delayed  # type: ignore
 def _delayed_subsample_indices_block(
-    arr_chunk: NDArrayNum, subsample_indices: NDArrayNum, block_id: dict[str, Any]
+    arr_chunk: NDArrayNum,
+    subsample_indices: NDArrayNum,
+    block_id: dict[str, Any],
+    mask_chunk: NDArrayBool | None = None,
 ) -> NDArrayNum:
     """Return 2D indices from the subsampled 1D valid indices per block."""
 
+    # only sample from the valid data
+    if mask_chunk is not None:
+        mask = np.where(np.isfinite(mask_chunk) & np.isfinite(arr_chunk), mask_chunk, False)
+    else:
+        mask = np.isfinite(arr_chunk)
     # Unravel indices of valid data to the shape of the block
-    ix, iy = np.unravel_index(np.argwhere(np.isfinite(arr_chunk.flatten()))[subsample_indices], shape=arr_chunk.shape)
+    # TODO i dont think the order of when .flatten() is applied matters, does it?
+    ix, iy = np.unravel_index(np.argwhere(arr_chunk[mask].flatten())[subsample_indices], shape=arr_chunk.shape)
 
     # Convert to full-array indexes by adding the row and column starting indexes for this block
     ix += block_id["xstart"]
@@ -126,13 +151,17 @@ def _delayed_subsample_indices_block(
     return np.hstack((ix, iy))
 
 
+# TODO
+# 1) output both indices and data not either or.
+# 2) optional accept a mask input
 def delayed_subsample(
     darr: da.Array,
+    mask: da.Array | None = None,
     subsample: int | float = 1,
     return_indices: bool = False,
     random_state: int | np.random.Generator | None = None,
     silence_max_subsample: bool = False,
-) -> NDArrayNum | tuple[NDArrayNum, NDArrayNum]:
+) -> tuple[NDArrayNum, None | NDArrayNum, None | NDArrayNum]:
     """
     Subsample a raster at valid values on out-of-memory chunks.
 
@@ -159,7 +188,7 @@ def delayed_subsample(
     :param silence_max_subsample: Whether to silence the warning for the subsample size being larger than the total
         number of valid points (warns by default).
 
-    :return: Subsample of values from the array (optionally, their indexes).
+    :return: Subsample of values from the array (optionally, their indexes). (x_indices, y_indices)
     """
 
     # Get random state
@@ -167,9 +196,17 @@ def delayed_subsample(
 
     # Compute number of valid points for each block out-of-memory
     blocks = darr.to_delayed().ravel()
+
+    if mask is not None:
+        mask_blocks = mask.to_delayed().ravel()
+    else:
+        mask_blocks = [None]  # zip longest will pass a None value for this block to delayed functions
+
     list_delayed_valids = [
-        da.from_delayed(_delayed_nb_valids(b), shape=(1, 1), dtype=np.dtype("int32")) for b in blocks
+        da.from_delayed(_delayed_nb_valids(b, mask_block), shape=(1, 1), dtype=np.dtype("int32"))
+        for b, mask_block in zip_longest(blocks, mask_blocks)
     ]
+
     nb_valids_per_block = np.concatenate([dask.compute(*list_delayed_valids)])
 
     # Sum to get total number of valid points
@@ -181,31 +218,31 @@ def delayed_subsample(
     )
 
     # Get random 1D indexes for the subsample size
+    # 1d_indices if the input where a list of valid pixels
     indices_1d = rng.choice(total_nb_valids, subsample_size, replace=False)
 
     # Sort which indexes belong to which chunk
+    # mapping to the actual indices in the block
     ind_per_block = _get_indices_block_per_subsample(
         indices_1d, num_chunks=darr.numblocks, nb_valids_per_block=nb_valids_per_block
     )
 
-    # To just get the subsample without indices
-    if not return_indices:
-        # Task a delayed subsample to be computed for each block, skipping blocks with no values to sample
-        list_subsamples = [
-            _delayed_subsample_block(b, ind)
-            for i, (b, ind) in enumerate(zip(blocks, ind_per_block))
-            if len(ind_per_block[i]) > 0
-        ]
-        # Cast output to the right expected dtype and length, then compute and concatenate
-        list_subsamples_delayed = [
-            da.from_delayed(s, shape=(nb_valids_per_block[i]), dtype=darr.dtype) for i, s in enumerate(list_subsamples)
-        ]
-        subsamples = np.concatenate(dask.compute(*list_subsamples_delayed), axis=0)
-
-        return subsamples
+    # Always get the subsamples
+    # Task a delayed subsample to be computed for each block, skipping blocks with no values to sample
+    list_subsamples = [
+        _delayed_subsample_block(b, ind, mask_block)
+        for i, (b, ind, mask_block) in enumerate(zip_longest(blocks, ind_per_block, mask_blocks))
+        if len(ind_per_block[i]) > 0
+    ]
+    # Cast output to the right expected dtype and length, then compute and concatenate
+    list_subsamples_delayed = [
+        da.from_delayed(s, shape=(nb_valids_per_block[i]), dtype=darr.dtype) for i, s in enumerate(list_subsamples)
+    ]
+    subsamples = np.concatenate(dask.compute(*list_subsamples_delayed), axis=0)
 
     # To return indices
-    else:
+    indices_x, indices_y = None, None
+    if return_indices:
         # Get starting 2D index for each chunk of the full array
         # (mirroring what is done in block_id of dask.array.map_blocks)
         # https://github.com/dask/dask/blob/24493f58660cb933855ba7629848881a6e2458c1/dask/array/core.py#L908
@@ -220,8 +257,8 @@ def delayed_subsample(
 
         # Task delayed subsample indices to be computed for each block, skipping blocks with no values to sample
         list_subsample_indices = [
-            _delayed_subsample_indices_block(b, ind, block_id=block_ids[i])
-            for i, (b, ind) in enumerate(zip(blocks, ind_per_block))
+            _delayed_subsample_indices_block(b, ind, block_id=block_ids[i], mask_chunk=mask_block)
+            for i, (b, ind, mask_block) in enumerate(zip(blocks, ind_per_block, mask_blocks))
             if len(ind_per_block[i]) > 0
         ]
         # Cast output to the right expected dtype and length, then compute and concatenate
@@ -231,7 +268,9 @@ def delayed_subsample(
         ]
         indices = np.concatenate(dask.compute(*list_subsamples_indices_delayed), axis=0)
 
-        return indices[:, 0], indices[:, 1]
+        indices_x, indices_y = indices[:, 0], indices[:, 1]
+
+    return subsamples, indices_x, indices_y
 
 
 # 2/ POINT INTERPOLATION ON REGULAR OR EQUAL GRID
@@ -722,9 +761,11 @@ def delayed_reproject(
     # transform of each tuples of source blocks
     src_block_ids = np.array(src_geotiling.get_block_locations())
     meta_params = [
-        _combined_blocks_shape_transform(sub_block_ids=src_block_ids[sbid], src_geogrid=src_geogrid)
-        if len(sbid) > 0
-        else ({}, [])
+        (
+            _combined_blocks_shape_transform(sub_block_ids=src_block_ids[sbid], src_geogrid=src_geogrid)
+            if len(sbid) > 0
+            else ({}, [])
+        )
         for sbid in dest2source
     ]
     # We also add the output transform/shape for this destination chunk in the combined meta

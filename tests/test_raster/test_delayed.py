@@ -306,7 +306,7 @@ class TestDelayed:
 
         # 1/ We run the delayed function after re-chunking
         darr = darr.rechunk(chunksizes_in_mem)
-        sub = delayed_subsample(darr, subsample=subsample_size, random_state=42)
+        sub, _, _ = delayed_subsample(darr, subsample=subsample_size, random_state=42)
         # 2/ Output checks
 
         # # The subsample should have exactly the prescribed length, with only valid values
@@ -315,9 +315,13 @@ class TestDelayed:
 
         # To verify the sampling works correctly, we can get its subsample indices with the argument return_indices
         # And compare to the same subsample with vindex (now that we know the coordinates of valid values sampled)
-        indices = delayed_subsample(darr, subsample=subsample_size, random_state=42, return_indices=True)
-        sub2 = np.array(darr.vindex[indices[0], indices[1]])
+        sub3, indices_x, indices_y = delayed_subsample(
+            darr, subsample=subsample_size, random_state=42, return_indices=True
+        )
+        sub2 = np.array(darr.vindex[indices_x, indices_y])
         assert np.array_equal(sub, sub2)
+
+    # Check outputs for a binary input
 
     @pytest.mark.parametrize("darr", list_small_darr)  # type: ignore
     @pytest.mark.parametrize("chunksizes_in_mem", list_small_chunksizes_in_mem)  # type: ignore
